@@ -130,6 +130,8 @@ function trainManager() {
   );
   manager.addDocument("en", "I have ongoing diarrhea and abdominal cramps.", "triage.gastroenterology");
   manager.addDocument("en", "heartburn", "triage.gastroenterology");
+  manager.addDocument("en", "acidity", "triage.gastroenterology");
+  manager.addDocument("en", "stomach burn", "triage.gastroenterology");
   manager.addDocument("en", "bloating", "triage.gastroenterology");
   manager.addDocument("en", "acidreflux", "triage.gastroenterology");
   manager.addDocument("en", "constipation", "triage.gastroenterology");
