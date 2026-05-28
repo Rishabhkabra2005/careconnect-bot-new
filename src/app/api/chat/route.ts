@@ -6,7 +6,7 @@ export const runtime = "nodejs";
 let managerPromise: Promise<NlpManager> | null = null;
 
 function trainManager() {
-  const manager = new NlpManager({ languages: ["en"], forceNER: true });
+  const manager = new NlpManager({ languages: ["en"], forceNER: true, autoSave: false });
 
   manager.addDocument("en", "hello", "greetings.hello");
   manager.addDocument("en", "hi", "greetings.hello");
