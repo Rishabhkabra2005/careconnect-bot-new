@@ -6,6 +6,7 @@ type Message = {
   id: string;
   role: "user" | "bot";
   content: string;
+  routedDepartment?: string;
 };
 
 const initialMessage: Message = {
@@ -39,13 +40,27 @@ export default function HomePage() {
     setError(null);
 
     try {
+      const apiMessages = [
+        ...messages
+          .filter((m) => m.id !== "welcome")
+          .map((m) => ({
+            role: m.role === "user" ? ("user" as const) : ("assistant" as const),
+            content: m.content,
+          })),
+        { role: "user" as const, content: text },
+      ];
+
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text }),
+        body: JSON.stringify({ messages: apiMessages }),
       });
 
-      const data = (await response.json()) as { answer?: string; error?: string };
+      const data = (await response.json()) as {
+        answer?: string;
+        routedDepartment?: string;
+        error?: string;
+      };
       if (!response.ok) {
         throw new Error(data.error || "Unable to process your request right now.");
       }
@@ -54,6 +69,7 @@ export default function HomePage() {
         id: `${Date.now()}-bot`,
         role: "bot",
         content: data.answer || "I'm sorry—I didn't quite understand that.",
+        routedDepartment: data.routedDepartment,
       };
       setMessages((prev) => [...prev, botMessage]);
     } catch (err) {
@@ -85,6 +101,11 @@ export default function HomePage() {
                     : "ml-auto bg-cyan-600 text-white"
                 }`}
               >
+                {msg.routedDepartment && msg.routedDepartment !== "CLARIFICATION_REQUIRED" ? (
+                  <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-cyan-700">
+                    Recommended: {msg.routedDepartment}
+                  </p>
+                ) : null}
                 {msg.content}
               </article>
             ))}
