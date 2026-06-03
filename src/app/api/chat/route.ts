@@ -36,7 +36,7 @@ export async function POST(req: Request) {
   type GateBContext = { category: GateBCategory; label: string };
 
   type TriageResult = {
-    gate: "A" | "B" | "fallback";
+    gate: "A" | "B" | "B-chronic" | "cold" | "fallback";
     clarification_kind?: ClarificationKind;
     extracted_symptom: string;
     severity: LlmSeverity;
@@ -44,6 +44,8 @@ export async function POST(req: Request) {
     target_department: TargetDepartment;
     empathetic_response: string;
   };
+
+  type DurationTier = "chronic" | "acute" | "none";
 
   // ===========================================================================
   // Typo map & constants
@@ -245,6 +247,7 @@ export async function POST(req: Request) {
     const normalized = normalizeMessage(raw);
 
     if (isSeverityOnlyTurn(raw)) return false;
+    if (matchesCommonCold(normalized)) return false;
 
     if (UNKNOWN_SYMPTOM_PATTERNS.some((re) => re.test(raw))) return true;
     if (normalized.length < 4 && !isSeverityOnlyTurn(normalized)) return true;
@@ -267,11 +270,104 @@ export async function POST(req: Request) {
         "ear",
         "throat",
         "sinus",
+        "cold",
       ])) {
         return true;
       }
     }
     return false;
+  };
+
+  // ===========================================================================
+  // Duration scanning (chronic >5 days vs acute <=4 days)
+  // ===========================================================================
+  const detectDurationTier = (text: string): DurationTier => {
+    const t = normalizeMessage(text);
+
+    if (
+      containsAny(t, [
+        "month",
+        "months",
+        "week",
+        "weeks",
+        "chronic",
+        "long time",
+        "for a while",
+        "for ages",
+        "persistent",
+        "ongoing",
+      ])
+    ) {
+      return "chronic";
+    }
+
+    const dayMatches = [...t.matchAll(/\b(\d+)\s*days?\b/g)];
+    for (const match of dayMatches) {
+      const days = parseInt(match[1], 10);
+      if (days >= 5) return "chronic";
+      if (days >= 1 && days <= 4) return "acute";
+    }
+
+    const weekMatches = [...t.matchAll(/\b(\d+)\s*weeks?\b/g)];
+    for (const match of weekMatches) {
+      const weeks = parseInt(match[1], 10);
+      if (weeks >= 1) return "chronic";
+    }
+
+    return "none";
+  };
+
+  const getGateBContextText = (
+    latestNormalized: string,
+    conversationMessages: ChatMessage[]
+  ): string => {
+    if (detectGateBSymptom(latestNormalized)) return latestNormalized;
+
+    const priorUserTurns = conversationMessages
+      .slice(0, -1)
+      .filter((m) => m.role === "user")
+      .map((m) => normalizeMessage(m.content))
+      .reverse();
+
+    for (const turn of priorUserTurns) {
+      if (isSeverityOnlyTurn(turn)) continue;
+      if (detectGateBSymptom(turn)) return `${turn} ${latestNormalized}`;
+    }
+
+    return latestNormalized;
+  };
+
+  const resolveDurationTier = (
+    latestNormalized: string,
+    conversationMessages: ChatMessage[]
+  ): DurationTier => {
+    const contextText = getGateBContextText(latestNormalized, conversationMessages);
+    return detectDurationTier(contextText);
+  };
+
+  // ===========================================================================
+  // Common cold — direct General Physician (no Gate B questions)
+  // ===========================================================================
+  const matchesCommonCold = (t: string): boolean => {
+    if (containsAny(t, ["common cold"])) return true;
+    if (/\b(i\s+)?(have|has|having|got|catch|caught|with)\s+(a\s+)?cold\b/.test(t)) return true;
+    if (hasWord(t, "cold") && containsAny(t, ["runny", "sniffle", "sneeze", "congestion", "viral"])) {
+      return true;
+    }
+    if (/^(i\s+)?(have\s+)?(a\s+)?cold\.?$/i.test(t.trim())) return true;
+    return false;
+  };
+
+  const runCommonColdRoute = (latestNormalized: string): TriageResult => {
+    const sentiment = detectSentiment(latestNormalized, false);
+    return {
+      gate: "cold",
+      extracted_symptom: "common cold",
+      severity: "mild",
+      sentiment,
+      target_department: "General Physician",
+      empathetic_response: buildRoutedResponse(sentiment, "common cold", "General Physician"),
+    };
   };
 
   // ===========================================================================
@@ -558,7 +654,8 @@ export async function POST(req: Request) {
 
     const mild = hasMild(latestNormalized);
     const severe = hasSevere(latestNormalized);
-    const sentiment = detectSentiment(latestNormalized, severe);
+    const durationTier = resolveDurationTier(latestNormalized, conversationMessages);
+    const sentiment = detectSentiment(latestNormalized, severe || durationTier === "chronic");
 
     if (gateB.category === "fever") {
       return {
@@ -568,6 +665,19 @@ export async function POST(req: Request) {
         sentiment,
         target_department: "General Physician",
         empathetic_response: buildRoutedResponse(sentiment, gateB.label, "General Physician"),
+      };
+    }
+
+    // Chronic escalation: >5 days / weeks / months — skip mild/severe question
+    if (durationTier === "chronic") {
+      const dept = severeDeptForGateB(gateB.category);
+      return {
+        gate: "B-chronic",
+        extracted_symptom: gateB.label,
+        severity: "severe",
+        sentiment,
+        target_department: dept,
+        empathetic_response: buildRoutedResponse(sentiment, gateB.label, dept),
       };
     }
 
@@ -629,6 +739,10 @@ export async function POST(req: Request) {
       if (gateBFromSeverity) return gateBFromSeverity;
     }
 
+    if (matchesCommonCold(latest)) {
+      return runCommonColdRoute(latest);
+    }
+
     const gateA = matchesGateA(latest);
     if (gateA) return gateA;
 
@@ -660,6 +774,15 @@ SEVERITY SHORTHAND (valid Gate B follow-up answers after a mild/severe question)
 - Mild: mild, mil, mld (typos map to mild)
 - Severe: severe, svr, sevr, sevear, svere
 Treat these as complete severity replies — use conversation history to find the active Gate B symptom.
+
+TIME-BASED CHRONIC ESCALATION (bypass mild/severe question for Gate B):
+- Duration >5 days, or weeks/months/chronic/long time/persistent/ongoing -> route DIRECTLY to specialist:
+  * Stomach/vomiting -> Gastroenterology | Muscle/back/leg pain -> Orthopedics
+  * Headache -> Neurology | Respiratory -> Pulmonology | Fever -> General Physician
+- Duration <=4 days (e.g. 2/3/4 days) or no time mentioned -> normal Gate B mild vs severe flow
+
+COMMON COLD (instant, no questions):
+- "cold" or "common cold" (e.g. "I have a cold") -> General Physician immediately
 
 GATE A — STRICT SPECIALIST BYPASS (latest message only; NEVER ask mild/severe; NEVER General Physician):
 - Heart/chest/palpitations -> Cardiology
@@ -780,11 +903,14 @@ ${normalizeMessage(latestMessage)}
       };
 
       const latestNorm = normalizeMessage(latestMessage);
+      if (matchesCommonCold(latestNorm)) return runCommonColdRoute(latestNorm);
+
       const gateAHit = matchesGateA(latestNorm);
       if (gateAHit) return gateAHit;
 
       const detGateB = runGateB(latestNorm, conversationMessages);
       if (detGateB) {
+        if (detGateB.gate === "B-chronic") return detGateB;
         if (detGateB.clarification_kind === "severity") return detGateB;
         if (isSeverityOnlyTurn(latestNorm)) return detGateB;
         if (detGateB.target_department !== "CLARIFICATION_REQUIRED") return detGateB;
@@ -882,6 +1008,8 @@ ${normalizeMessage(latestMessage)}
 
     manager.addDocument("en", "I have a low-grade fever and body aches since yesterday.", "triage.general_physician");
     manager.addDocument("en", "I have muscle pain in my shoulders.", "triage.general_physician");
+    manager.addDocument("en", "I think I have a common cold.", "triage.general_physician");
+    manager.addDocument("en", "I have a cold and runny nose.", "triage.general_physician");
     manager.addAnswer("en", "triage.general_physician", nlpAnswer("triage.general_physician"));
 
     manager.addAnswer("en", "None", nlpAnswer("None"));
