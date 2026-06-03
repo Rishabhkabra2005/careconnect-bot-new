@@ -5,11 +5,12 @@ export const runtime = "nodejs";
 
 export async function POST(req: Request) {
   // ===========================================================================
-  // Types (request-scoped only)
+  // Types (request-scoped only — no module-level state)
   // ===========================================================================
   type ChatMessage = { role: "user" | "assistant"; content: string };
   type LlmSeverity = "mild" | "severe" | "ambiguous";
   type SentimentLabel = "worried" | "uncomfortable" | "distressed" | "concerned";
+  type ClarificationKind = "severity" | "unknown_symptom";
   type TargetDepartment =
     | "Dermatology"
     | "Cardiology"
@@ -24,10 +25,19 @@ export async function POST(req: Request) {
     | "Pediatrics"
     | "CLARIFICATION_REQUIRED";
 
-  type GateBSymptom = "stomach" | "vomiting" | "respiratory" | "fever" | "ent";
+  type GateBCategory =
+    | "musculoskeletal"
+    | "stomach"
+    | "vomiting"
+    | "respiratory"
+    | "headache"
+    | "fever";
+
+  type GateBContext = { category: GateBCategory; label: string };
 
   type TriageResult = {
-    gate: "A" | "B" | "C" | "clarify";
+    gate: "A" | "B" | "fallback";
+    clarification_kind?: ClarificationKind;
     extracted_symptom: string;
     severity: LlmSeverity;
     sentiment: SentimentLabel;
@@ -36,47 +46,86 @@ export async function POST(req: Request) {
   };
 
   // ===========================================================================
-  // Per-request constants
+  // Typo map & constants
   // ===========================================================================
   const TYPO_MAP: Record<string, string> = {
     frasctreu: "fracture",
     frature: "fracture",
+    bak: "back",
+    lig: "leg",
+    sholder: "shoulder",
+    hedake: "headache",
+    hedache: "headache",
+    pimpl: "pimple",
+    pimplt: "pimple",
+    rashe: "rash",
+    alergie: "allergy",
+    alergy: "allergy",
+    iching: "itching",
+    skinn: "skin",
+    urn: "urine",
+    urinn: "urine",
+    kidny: "kidney",
+    bladr: "bladder",
     svere: "severe",
+    mil: "mild",
+    mld: "mild",
+    svr: "severe",
+    sevr: "severe",
+    sevear: "severe",
     ahving: "having",
+    hert: "heart",
+    haert: "heart",
     eyee: "eye",
     noze: "nose",
-    haert: "heart",
-    hert: "heart",
+    eer: "ear",
+    throte: "throat",
     stomak: "stomach",
     acidty: "acidity",
     mils: "mild",
     midl: "mild",
     norml: "normal",
     fevr: "fever",
-    kidny: "kidney",
     vomitting: "vomiting",
     vomitng: "vomiting",
     nausia: "nausea",
     couhg: "cough",
     breth: "breath",
+    palpitaton: "palpitation",
+    vison: "vision",
+    blury: "blurry",
+    muslce: "muscle",
+    muslces: "muscles",
   };
 
   const FILLER_PATTERN = /\b(issues?|problems?|trouble|concerns?)\b/gi;
-  const CHILD_TOKENS = ["baby", "child", "kid", "toddler", "infant", "son", "daughter", "newborn"];
-  const MILD_WORDS = ["mild", "normal", "light", "slight", "manageable", "low-grade"];
+  const MILD_WORDS = ["mild", "mil", "mld", "normal", "light", "slight", "manageable", "low-grade"];
   const SEVERE_WORDS = [
     "severe",
+    "svr",
+    "sevr",
+    "sevear",
     "unbearable",
     "intense",
     "sharp",
-    "burning",
     "chronic",
     "high fever",
-    "high temperature",
     "worst",
     "emergency",
   ];
   const DISTRESS_WORDS = ["scared", "afraid", "terrified", "panic", "can't breathe", "help", "emergency", "dying"];
+
+  const UNKNOWN_SYMPTOM_PATTERNS = [
+    /^symptoms?\.?$/i,
+    /^i feel weird\.?$/i,
+    /^feel weird\.?$/i,
+    /^i am not feeling well\.?$/i,
+    /^not feeling well\.?$/i,
+    /^something is wrong\.?$/i,
+    /^i need help\.?$/i,
+    /^help me\.?$/i,
+    /^medical help\.?$/i,
+  ];
 
   const ALLOWED_DEPARTMENTS: TargetDepartment[] = [
     "Dermatology",
@@ -93,14 +142,16 @@ export async function POST(req: Request) {
     "CLARIFICATION_REQUIRED",
   ];
 
+  const UNKNOWN_SYMPTOM_RESPONSE =
+    "I understand you are seeking medical guidance. I couldn't quite identify your specific symptom from your message. Could you please tell me which part of your body is affected or describe what you are feeling in more detail so I can guide you to the right department?";
+
   const NLP_ANSWERS: Record<string, string> = {
     "greetings.hello": "Hello! Welcome to CareConnect Health. How can I help you today?",
     "faq.hours":
       "Our Emergency Department is open 24/7. Regular outpatient services operate from 9 AM to 6 PM.",
     "faq.location": "We are located at 123 Health Ave.",
     "faq.costs": "Consultation costs start at $50, depending on the specialist and services required.",
-    "triage.cardiology":
-      "Based on what you shared, a Cardiology consultation would be appropriate.",
+    "triage.cardiology": "Based on what you shared, a Cardiology consultation would be appropriate.",
     "triage.gastroenterology":
       "A Gastroenterology consultation is recommended for digestive symptoms like these.",
     "triage.ophthalmology": "For eye or vision concerns, an Ophthalmology visit is recommended.",
@@ -124,9 +175,14 @@ export async function POST(req: Request) {
   const containsAny = (text: string, needles: string[]): boolean =>
     needles.some((n) => text.includes(n));
 
+  const hasWord = (text: string, word: string): boolean =>
+    new RegExp(`\\b${word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(text);
+
   const normalizeTypos = (text: string): string => {
     let out = text.toLowerCase();
-    for (const [wrong, correct] of Object.entries(TYPO_MAP)) {
+    const sortedKeys = Object.keys(TYPO_MAP).sort((a, b) => b.length - a.length);
+    for (const wrong of sortedKeys) {
+      const correct = TYPO_MAP[wrong];
       out = out.replace(new RegExp(`\\b${wrong}\\b`, "gi"), correct);
     }
     return out;
@@ -144,14 +200,20 @@ export async function POST(req: Request) {
   const isTargetDepartment = (value: string): value is TargetDepartment =>
     ALLOWED_DEPARTMENTS.includes(value as TargetDepartment);
 
+  const hasMild = (text: string): boolean => containsAny(normalizeMessage(text), MILD_WORDS);
+  const hasSevere = (text: string): boolean => containsAny(normalizeMessage(text), SEVERE_WORDS);
+
   const detectSentiment = (text: string, isSevere: boolean): SentimentLabel => {
     if (containsAny(text, DISTRESS_WORDS) || isSevere) return "distressed";
-    if (containsAny(text, ["worried", "anxious", "nervous", "concerned"])) return "worried";
+    if (containsAny(text, ["worried", "anxious", "nervous"])) return "worried";
     if (containsAny(text, ["uncomfortable", "hurts", "aching", "sore"])) return "uncomfortable";
     return "concerned";
   };
 
-  const buildEmpatheticResponse = (
+  const buildSeverityClarification = (sentiment: SentimentLabel, symptomLabel: string): string =>
+    `I understand you're feeling ${sentiment === "distressed" ? "distressed" : sentiment === "worried" ? "worried" : sentiment === "uncomfortable" ? "uncomfortable" : "concerned"} about your ${symptomLabel}. I see you're experiencing ${symptomLabel}. Is this mild/manageable or is it severe?`;
+
+  const buildRoutedResponse = (
     sentiment: SentimentLabel,
     symptomLabel: string,
     department: TargetDepartment
@@ -164,10 +226,6 @@ export async function POST(req: Request) {
           : sentiment === "uncomfortable"
             ? "uncomfortable"
             : "concerned";
-
-    if (department === "CLARIFICATION_REQUIRED") {
-      return `I understand you're feeling ${feeling} about your ${symptomLabel}. I see you're experiencing ${symptomLabel}. Is this mild/manageable or is it severe?`;
-    }
     if (department === "General Physician") {
       return `I understand you're feeling ${feeling} about your ${symptomLabel}. Based on what you've shared, I recommend consulting a General Physician for an initial evaluation.`;
     }
@@ -175,45 +233,236 @@ export async function POST(req: Request) {
   };
 
   const isSeverityOnlyTurn = (latest: string): boolean => {
-    const t = latest.trim();
+    const t = normalizeMessage(latest.trim());
     if (!t) return false;
-    const words = t.split(/\s+/);
-    return words.length <= 4 && (containsAny(t, MILD_WORDS) || containsAny(t, SEVERE_WORDS));
+    const words = t.split(/\s+/).filter(Boolean);
+    if (words.length > 4) return false;
+    return hasMild(t) || hasSevere(t);
   };
 
-  const hasMild = (text: string): boolean => containsAny(text, MILD_WORDS);
-  const hasSevere = (text: string): boolean => containsAny(text, SEVERE_WORDS);
+  const isUnknownGenericInput = (latest: string): boolean => {
+    const raw = latest.trim().toLowerCase();
+    const normalized = normalizeMessage(raw);
 
-  const priorUserText = (allMsgs: ChatMessage[]): string =>
-    normalizeMessage(
-      allMsgs
-        .slice(0, -1)
-        .filter((m) => m.role === "user")
-        .map((m) => m.content)
-        .join(" ")
-    );
+    if (isSeverityOnlyTurn(raw)) return false;
 
-  const historyHasChildContext = (msgs: ChatMessage[]): boolean =>
-    containsAny(
-      normalizeMessage(msgs.map((m) => m.content).join(" ")),
-      CHILD_TOKENS
-    );
-
-  const pickPediatricsOr = (
-    childContext: boolean,
-    systemicInPriorOrLatest: boolean,
-    defaultDept: TargetDepartment
-  ): TargetDepartment => {
-    if (childContext && systemicInPriorOrLatest) return "Pediatrics";
-    return defaultDept;
+    if (UNKNOWN_SYMPTOM_PATTERNS.some((re) => re.test(raw))) return true;
+    if (normalized.length < 4 && !isSeverityOnlyTurn(normalized)) return true;
+    if (containsAny(raw, ["symptom", "weird", "unwell", "uncomfortable"]) && raw.split(/\s+/).length <= 5) {
+      if (!containsAny(normalizeMessage(raw), [
+        "pain",
+        "ache",
+        "fever",
+        "cough",
+        "vomit",
+        "rash",
+        "heart",
+        "eye",
+        "stomach",
+        "headache",
+        "muscle",
+        "joint",
+        "fracture",
+        "nose",
+        "ear",
+        "throat",
+        "sinus",
+      ])) {
+        return true;
+      }
+    }
+    return false;
   };
 
   // ===========================================================================
-  // Gate B symptom detection (latest message primary)
+  // GATE A — Strict specialist bypass (latest turn only)
   // ===========================================================================
-  const detectGateBSymptom = (latest: string): { category: GateBSymptom; label: string } | null => {
+  const matchesGateA = (t: string): TriageResult | null => {
     if (
-      containsAny(latest, [
+      containsAny(t, [
+        "heart",
+        "chest",
+        "palpitation",
+        "palpitations",
+        "cardiac",
+        "heartbeat",
+        "chest pain",
+      ])
+    ) {
+      const sentiment = detectSentiment(t, hasSevere(t));
+      return {
+        gate: "A",
+        extracted_symptom: "heart/chest symptoms",
+        severity: "severe",
+        sentiment,
+        target_department: "Cardiology",
+        empathetic_response: buildRoutedResponse(sentiment, "heart/chest symptoms", "Cardiology"),
+      };
+    }
+
+    if (
+      containsAny(t, [
+        "eye",
+        "eyes",
+        "vision",
+        "blurry",
+        "blurred",
+        "sight",
+        "blind",
+        "blindness",
+      ])
+    ) {
+      const sentiment = detectSentiment(t, hasSevere(t));
+      return {
+        gate: "A",
+        extracted_symptom: "eye/vision symptoms",
+        severity: "severe",
+        sentiment,
+        target_department: "Ophthalmology",
+        empathetic_response: buildRoutedResponse(sentiment, "eye/vision symptoms", "Ophthalmology"),
+      };
+    }
+
+    if (
+      containsAny(t, [
+        "fracture",
+        "dislocation",
+        "dislocated",
+        "joint pain",
+        "joints pain",
+        "joints ache",
+      ]) ||
+      (containsAny(t, ["joint", "joints"]) && containsAny(t, ["pain", "ache", "hurt"]))
+    ) {
+      const sentiment = detectSentiment(t, true);
+      return {
+        gate: "A",
+        extracted_symptom: "joint or fracture symptoms",
+        severity: "severe",
+        sentiment,
+        target_department: "Orthopedics",
+        empathetic_response: buildRoutedResponse(sentiment, "joint or fracture symptoms", "Orthopedics"),
+      };
+    }
+
+    if (
+      containsAny(t, [
+        "skin",
+        "rash",
+        "rashes",
+        "itch",
+        "itching",
+        "eczema",
+        "pimple",
+        "acne",
+        "hives",
+        "allergy",
+        "allergies",
+      ])
+    ) {
+      const sentiment = detectSentiment(t, hasSevere(t));
+      return {
+        gate: "A",
+        extracted_symptom: "skin or allergy symptoms",
+        severity: "severe",
+        sentiment,
+        target_department: "Dermatology",
+        empathetic_response: buildRoutedResponse(sentiment, "skin or allergy symptoms", "Dermatology"),
+      };
+    }
+
+    if (
+      containsAny(t, ["kidney pain", "kidney"]) ||
+      containsAny(t, ["bladder"]) ||
+      containsAny(t, ["burning urine", "burns when i urinate", "burns when i pee"]) ||
+      (containsAny(t, ["urine", "urinary", "urinate"]) && containsAny(t, ["burn", "burning", "pain"]))
+    ) {
+      const sentiment = detectSentiment(t, hasSevere(t));
+      return {
+        gate: "A",
+        extracted_symptom: "kidney or urinary symptoms",
+        severity: "severe",
+        sentiment,
+        target_department: "Urology",
+        empathetic_response: buildRoutedResponse(sentiment, "kidney or urinary symptoms", "Urology"),
+      };
+    }
+
+    if (containsAny(t, ["paralysis", "seizure", "numbness", "sudden numb", "stroke", "convulsion"])) {
+      const sentiment = detectSentiment(t, true);
+      return {
+        gate: "A",
+        extracted_symptom: "neurological symptoms",
+        severity: "severe",
+        sentiment,
+        target_department: "Neurology",
+        empathetic_response: buildRoutedResponse(sentiment, "neurological symptoms", "Neurology"),
+      };
+    }
+
+    if (
+      hasWord(t, "nose") ||
+      hasWord(t, "ear") ||
+      containsAny(t, ["ear pain", "earache", "sore throat", "sinus", "nostril", "tonsil", "nasal"]) ||
+      (hasWord(t, "throat") && containsAny(t, ["pain", "ache", "sore", "hurt"]))
+    ) {
+      const sentiment = detectSentiment(t, hasSevere(t));
+      const entLabel = containsAny(t, ["nose", "nostril", "sinus", "nasal"])
+        ? "nose or sinus symptoms"
+        : hasWord(t, "ear") || containsAny(t, ["earache", "ear pain"])
+          ? "ear symptoms"
+          : "throat symptoms";
+      return {
+        gate: "A",
+        extracted_symptom: entLabel,
+        severity: "severe",
+        sentiment,
+        target_department: "ENT",
+        empathetic_response: buildRoutedResponse(sentiment, entLabel, "ENT"),
+      };
+    }
+
+    return null;
+  };
+
+  // ===========================================================================
+  // GATE B — Interactive musculoskeletal / systemic (NOT joints/fractures)
+  // ===========================================================================
+  const detectGateBSymptom = (text: string): GateBContext | null => {
+    const t = normalizeMessage(text);
+    if (!t) return null;
+
+    if (
+      containsAny(t, [
+        "back pain",
+        "leg pain",
+        "hand pain",
+        "arm pain",
+        "shoulder pain",
+        "neck pain",
+        "body ache",
+        "muscle pain",
+        "muscle ache",
+        "muscles ache",
+        "body pain",
+      ]) ||
+      (containsAny(t, ["back", "leg", "hand", "arm", "shoulder", "neck"]) &&
+        containsAny(t, ["pain", "ache", "hurt", "sore"])) ||
+      containsAny(t, ["muscle", "muscles"])
+    ) {
+      if (containsAny(t, ["muscle", "muscles"])) {
+        return { category: "musculoskeletal", label: "muscle pain" };
+      }
+      if (containsAny(t, ["back"])) return { category: "musculoskeletal", label: "back pain" };
+      if (containsAny(t, ["leg"])) return { category: "musculoskeletal", label: "leg pain" };
+      if (containsAny(t, ["hand", "arm"])) return { category: "musculoskeletal", label: "hand or arm pain" };
+      if (containsAny(t, ["shoulder"])) return { category: "musculoskeletal", label: "shoulder pain" };
+      if (containsAny(t, ["neck"])) return { category: "musculoskeletal", label: "neck pain" };
+      return { category: "musculoskeletal", label: "musculoskeletal ache" };
+    }
+
+    if (
+      containsAny(t, [
         "stomach",
         "belly",
         "abdomen",
@@ -226,11 +475,13 @@ export async function POST(req: Request) {
     ) {
       return { category: "stomach", label: "stomach discomfort" };
     }
-    if (containsAny(latest, ["vomit", "vomiting", "nausea", "throwing up", "threw up"])) {
-      return { category: "vomiting", label: "vomiting" };
+
+    if (containsAny(t, ["vomit", "vomiting", "nausea", "throwing up"])) {
+      return { category: "vomiting", label: "vomiting or nausea" };
     }
+
     if (
-      containsAny(latest, [
+      containsAny(t, [
         "cough",
         "breath",
         "breathing",
@@ -244,340 +495,195 @@ export async function POST(req: Request) {
     ) {
       return { category: "respiratory", label: "breathing difficulty" };
     }
-    if (containsAny(latest, ["fever", "chills", "temperature", "febrile"])) {
+
+    if (containsAny(t, ["headache", "migraine"])) {
+      return { category: "headache", label: "headache" };
+    }
+
+    if (containsAny(t, ["fever", "chills", "temperature", "febrile"])) {
       return { category: "fever", label: "fever" };
     }
-    if (
-      containsAny(latest, [
-        "nose",
-        "nostril",
-        "sinus",
-        "ear",
-        "earache",
-        "throat",
-        "tonsil",
-        "nasal",
-        "hearing",
-      ])
-    ) {
-      if (containsAny(latest, ["nose", "nostril", "sinus", "nasal"])) {
-        return { category: "ent", label: "nose pain" };
-      }
-      if (containsAny(latest, ["ear", "earache", "hearing"])) {
-        return { category: "ent", label: "ear pain" };
-      }
-      return { category: "ent", label: "throat or sinus discomfort" };
+
+    return null;
+  };
+
+  const findGateBSymptomInHistory = (conversationMessages: ChatMessage[]): GateBContext | null => {
+    const priorUserTurns = conversationMessages
+      .slice(0, -1)
+      .filter((m) => m.role === "user")
+      .map((m) => normalizeMessage(m.content))
+      .reverse();
+
+    for (const turn of priorUserTurns) {
+      if (isSeverityOnlyTurn(turn)) continue;
+      const hit = detectGateBSymptom(turn);
+      if (hit) return hit;
     }
     return null;
   };
 
-  const detectGateBSymptomFromPrior = (prior: string): { category: GateBSymptom; label: string } | null =>
-    detectGateBSymptom(prior);
+  const resolveGateBContext = (
+    latestNormalized: string,
+    conversationMessages: ChatMessage[]
+  ): GateBContext | null => {
+    const fromLatest = detectGateBSymptom(latestNormalized);
+    if (fromLatest) return fromLatest;
+    if (isSeverityOnlyTurn(latestNormalized)) {
+      return findGateBSymptomInHistory(conversationMessages);
+    }
+    return null;
+  };
 
-  const severeSpecialistForGateB = (category: GateBSymptom): TargetDepartment => {
+  const severeDeptForGateB = (category: GateBCategory): TargetDepartment => {
     switch (category) {
+      case "musculoskeletal":
+        return "Orthopedics";
       case "stomach":
       case "vomiting":
         return "Gastroenterology";
       case "respiratory":
         return "Pulmonology";
+      case "headache":
+        return "Neurology";
       case "fever":
         return "General Physician";
-      case "ent":
-        return "ENT";
       default:
         return "General Physician";
     }
   };
 
-  // ===========================================================================
-  // GATE A — Anatomy-first bypass (latest message only)
-  // ===========================================================================
-  const runGateA = (latest: string): TriageResult | null => {
-    if (
-      containsAny(latest, [
-        "heart",
-        "chest",
-        "palpitation",
-        "palpitations",
-        "cardiac",
-        "heartbeat",
-        "chest pain",
-      ])
-    ) {
-      const sev = hasSevere(latest);
-      return {
-        gate: "A",
-        extracted_symptom: "heart/chest",
-        severity: sev ? "severe" : "ambiguous",
-        sentiment: detectSentiment(latest, sev),
-        target_department: "Cardiology",
-        empathetic_response: buildEmpatheticResponse(
-          detectSentiment(latest, sev),
-          "heart symptoms",
-          "Cardiology"
-        ),
-      };
-    }
-
-    if (
-      containsAny(latest, [
-        "eye",
-        "eyes",
-        "vision",
-        "blurry",
-        "blurred",
-        "sight",
-        "blind",
-        "blindness",
-        "conjunctivitis",
-      ])
-    ) {
-      const sev = hasSevere(latest);
-      return {
-        gate: "A",
-        extracted_symptom: "eye/vision",
-        severity: sev ? "severe" : "ambiguous",
-        sentiment: detectSentiment(latest, sev),
-        target_department: "Ophthalmology",
-        empathetic_response: buildEmpatheticResponse(
-          detectSentiment(latest, sev),
-          "eye symptoms",
-          "Ophthalmology"
-        ),
-      };
-    }
-
-    if (
-      containsAny(latest, [
-        "fracture",
-        "frasctreu",
-        "dislocation",
-        "joint pain",
-        "joints pain",
-        "bone",
-        "sprain",
-        "arthritis",
-        "knee",
-        "ankle",
-        "wrist",
-      ])
-    ) {
-      const sev = hasSevere(latest);
-      return {
-        gate: "A",
-        extracted_symptom: "bone/joint",
-        severity: sev ? "severe" : "ambiguous",
-        sentiment: detectSentiment(latest, sev),
-        target_department: "Orthopedics",
-        empathetic_response: buildEmpatheticResponse(
-          detectSentiment(latest, sev),
-          "bone or joint symptoms",
-          "Orthopedics"
-        ),
-      };
-    }
-
-    if (
-      containsAny(latest, [
-        "skin",
-        "rash",
-        "rashes",
-        "itch",
-        "itching",
-        "eczema",
-        "pimple",
-        "acne",
-        "hives",
-      ])
-    ) {
-      const sev = hasSevere(latest);
-      return {
-        gate: "A",
-        extracted_symptom: "skin",
-        severity: sev ? "severe" : "ambiguous",
-        sentiment: detectSentiment(latest, sev),
-        target_department: "Dermatology",
-        empathetic_response: buildEmpatheticResponse(
-          detectSentiment(latest, sev),
-          "skin symptoms",
-          "Dermatology"
-        ),
-      };
-    }
-
-    if (
-      containsAny(latest, ["paralysis", "seizure", "numbness", "sudden numb", "stroke", "convulsion"])
-    ) {
-      const sev = true;
-      return {
-        gate: "A",
-        extracted_symptom: "neurological",
-        severity: "severe",
-        sentiment: detectSentiment(latest, sev),
-        target_department: "Neurology",
-        empathetic_response: buildEmpatheticResponse(
-          detectSentiment(latest, sev),
-          "neurological symptoms",
-          "Neurology"
-        ),
-      };
-    }
-
-    if (containsAny(latest, ["kidney", "urine", "urinary", "bladder", "prostate"])) {
-      const sev = hasSevere(latest);
-      return {
-        gate: "A",
-        extracted_symptom: "kidney/urinary",
-        severity: sev ? "severe" : "ambiguous",
-        sentiment: detectSentiment(latest, sev),
-        target_department: "Urology",
-        empathetic_response: buildEmpatheticResponse(
-          detectSentiment(latest, sev),
-          "kidney or urinary symptoms",
-          "Urology"
-        ),
-      };
-    }
-
-    return null;
-  };
-
-  // ===========================================================================
-  // GATE B — Systemic triage (latest + severity follow-up from prior)
-  // ===========================================================================
-  const runGateB = (
-    latest: string,
-    prior: string,
-    childContext: boolean
-  ): TriageResult | null => {
-    const mild = hasMild(latest);
-    const severe = hasSevere(latest);
-    const sentiment = detectSentiment(latest, severe);
-
-    let gateB = detectGateBSymptom(latest);
-
-    if (!gateB && isSeverityOnlyTurn(latest)) {
-      gateB = detectGateBSymptomFromPrior(prior);
-    }
-
+  const runGateB = (latestNormalized: string, conversationMessages: ChatMessage[]): TriageResult | null => {
+    const gateB = resolveGateBContext(latestNormalized, conversationMessages);
     if (!gateB) return null;
 
-    const systemic = containsAny(`${prior} ${latest}`, [
-      "fever",
-      "cough",
-      "vomiting",
-      "vomit",
-      "nausea",
-    ]);
+    const mild = hasMild(latestNormalized);
+    const severe = hasSevere(latestNormalized);
+    const sentiment = detectSentiment(latestNormalized, severe);
 
-    if (mild || (isSeverityOnlyTurn(latest) && hasMild(latest))) {
-      const dept = pickPediatricsOr(childContext, systemic, "General Physician");
+    if (gateB.category === "fever") {
       return {
-        gate: childContext && systemic ? "C" : "B",
+        gate: "B",
+        extracted_symptom: gateB.label,
+        severity: "ambiguous",
+        sentiment,
+        target_department: "General Physician",
+        empathetic_response: buildRoutedResponse(sentiment, gateB.label, "General Physician"),
+      };
+    }
+
+    if (mild) {
+      return {
+        gate: "B",
         extracted_symptom: gateB.label,
         severity: "mild",
         sentiment,
-        target_department: dept,
-        empathetic_response: buildEmpatheticResponse(sentiment, gateB.label, dept),
+        target_department: "General Physician",
+        empathetic_response: buildRoutedResponse(sentiment, gateB.label, "General Physician"),
       };
     }
 
-    if (severe || (isSeverityOnlyTurn(latest) && hasSevere(latest))) {
-      const specialist = severeSpecialistForGateB(gateB.category);
-      const dept =
-        gateB.category === "fever" && childContext
-          ? "Pediatrics"
-          : pickPediatricsOr(childContext, systemic && gateB.category !== "fever", specialist);
+    if (severe) {
+      const dept = severeDeptForGateB(gateB.category);
       return {
-        gate: dept === "Pediatrics" ? "C" : "B",
+        gate: "B",
         extracted_symptom: gateB.label,
         severity: "severe",
         sentiment,
         target_department: dept,
-        empathetic_response: buildEmpatheticResponse(sentiment, gateB.label, dept),
+        empathetic_response: buildRoutedResponse(sentiment, gateB.label, dept),
       };
     }
 
     return {
-      gate: "clarify",
+      gate: "B",
+      clarification_kind: "severity",
       extracted_symptom: gateB.label,
       severity: "ambiguous",
       sentiment,
       target_department: "CLARIFICATION_REQUIRED",
-      empathetic_response: buildEmpatheticResponse(sentiment, gateB.label, "CLARIFICATION_REQUIRED"),
+      empathetic_response: buildSeverityClarification(sentiment, gateB.label),
+    };
+  };
+
+  const runUnknownFallback = (latestNormalized: string): TriageResult => {
+    const sentiment = detectSentiment(latestNormalized, false);
+    return {
+      gate: "fallback",
+      clarification_kind: "unknown_symptom",
+      extracted_symptom: "unspecified",
+      severity: "ambiguous",
+      sentiment,
+      target_department: "CLARIFICATION_REQUIRED",
+      empathetic_response: UNKNOWN_SYMPTOM_RESPONSE,
     };
   };
 
   // ===========================================================================
-  // Master triage (deterministic — always runs)
+  // Master triage
   // ===========================================================================
-  const runThreeGateTriage = (
-    latestRaw: string,
-    conversationMessages: ChatMessage[],
-    childContext: boolean
-  ): TriageResult => {
+  const runClinicalTriage = (latestRaw: string, conversationMessages: ChatMessage[]): TriageResult => {
     const latest = normalizeMessage(latestRaw);
-    const prior = priorUserText(conversationMessages);
 
-    const gateA = runGateA(latest);
+    if (isSeverityOnlyTurn(latestRaw)) {
+      const gateBFromSeverity = runGateB(latest, conversationMessages);
+      if (gateBFromSeverity) return gateBFromSeverity;
+    }
+
+    const gateA = matchesGateA(latest);
     if (gateA) return gateA;
 
-    const gateB = runGateB(latest, prior, childContext);
+    if (!isSeverityOnlyTurn(latestRaw) && isUnknownGenericInput(latestRaw)) {
+      return runUnknownFallback(latest);
+    }
+
+    const gateB = runGateB(latest, conversationMessages);
     if (gateB) return gateB;
 
     if (isSeverityOnlyTurn(latest)) {
-      const priorGateB = detectGateBSymptomFromPrior(prior);
-      if (priorGateB) {
-        return runGateB(latest, prior, childContext)!;
+      const historical = findGateBSymptomInHistory(conversationMessages);
+      if (historical) {
+        const retry = runGateB(latest, conversationMessages);
+        if (retry) return retry;
       }
     }
 
-    const fallbackSymptom = "symptoms";
-    return {
-      gate: "clarify",
-      extracted_symptom: fallbackSymptom,
-      severity: "ambiguous",
-      sentiment: detectSentiment(latest, false),
-      target_department: "CLARIFICATION_REQUIRED",
-      empathetic_response: buildEmpatheticResponse(
-        detectSentiment(latest, false),
-        fallbackSymptom,
-        "CLARIFICATION_REQUIRED"
-      ),
-    };
+    return runUnknownFallback(latest);
   };
 
   // ===========================================================================
-  // LLM enhancement layer (optional; validated against gates)
+  // LLM layer (aligned with gates; code validation wins)
   // ===========================================================================
   const TRIAGE_SYSTEM_PROMPT = `
-You are a stateless 3-Gate Clinical Triage Engine. Classify using the LATEST user message.
-Use full conversation history only for follow-ups (e.g. user said "mild" after you asked severity).
+You are a stateless split clinical triage engine. Apply typo normalization first.
 
-GATE A — ANATOMY-FIRST (instant specialist, NEVER General Physician, NEVER ask mild/severe):
+SEVERITY SHORTHAND (valid Gate B follow-up answers after a mild/severe question):
+- Mild: mild, mil, mld (typos map to mild)
+- Severe: severe, svr, sevr, sevear, svere
+Treat these as complete severity replies — use conversation history to find the active Gate B symptom.
+
+GATE A — STRICT SPECIALIST BYPASS (latest message only; NEVER ask mild/severe; NEVER General Physician):
 - Heart/chest/palpitations -> Cardiology
-- Eyes/vision/blurry/sight/blindness -> Ophthalmology
-- Fracture/frasctreu/dislocation/joint pain -> Orthopedics
-- Skin/rash/eczema/pimple/itching -> Dermatology
+- Eyes/vision/blurry -> Ophthalmology
+- Fracture/dislocation/joint pain/joints pain ONLY -> Orthopedics (NOT back pain, leg pain, or muscle pain)
+- Skin/rash/allergies/pimples/itching -> Dermatology
+- Burning urine/kidney pain/bladder issues -> Urology
 - Paralysis/seizure/sudden numbness -> Neurology
-- Kidney/urine/bladder -> Urology
+- ENT instant bypass: nose/noze, ear/ear pain/earache, throat/sore throat, sinus -> ENT (turn 1, no severity question)
 
-GATE B — SYSTEMIC (mild vs severe ONLY for these):
-- Stomach (pain, acidity, burning) | Vomiting/nausea | Respiratory (cough, breathing, congestion) | Fever/chills | ENT (nose pain, ear ache, sore throat, sinus)
-Rules:
-1. Ambiguous (e.g. "vomiting", "nose pain", "stomach pain" alone) -> CLARIFICATION_REQUIRED with: "I see you're experiencing [symptom]. Is this mild/manageable or is it severe?"
-2. Mild -> General Physician
-3. Severe -> Gastroenterology (stomach/vomiting), Pulmonology (respiratory), ENT (nose/ear/throat), General Physician (fever unless child)
+GATE B — INTERACTIVE (ask mild vs severe when ambiguous):
+Musculoskeletal aches ONLY: back pain, leg pain, hand pain, arm, shoulder, neck, muscle, muscles, body ache
+  - Mild (or mil/mld) -> General Physician | Severe (or svr/sevr) -> Orthopedics
+Stomach pain, acidity, nausea, vomiting -> Gastroenterology (severe) or General Physician (mild)
+Respiratory: breathing, cough, congestion -> Pulmonology (severe) or General Physician (mild)
+Headache, migraine -> Neurology (severe) or General Physician (mild)
+Fever/chills -> General Physician directly (no severity question)
 
-GATE C — PEDIATRICS:
-Only if baby/child/kid/son/daughter/infant appears in history for Gate B systemic symptoms.
+When latest is only a severity shorthand (mil, mld, mild, svr, sevr, severe), read conversation history to find the active Gate B symptom (e.g. breathing difficulty, muscle pain).
 
-Normalize typos: frasctreu->fracture, svere->severe, ahving->having, hert->heart, eyee->eye, noze->nose, stomak->stomach.
-Treat "stomach issues" as stomach pain -> Gate B clarify.
-
-Sentiment: worried | uncomfortable | distressed | concerned
-Start empathetic_response with: "I understand you're feeling [sentiment] about your [symptom]..."
+UNKNOWN / UNMAPPED (e.g. "symptoms", "i feel weird"):
+- target_department: CLARIFICATION_REQUIRED
+- Do NOT ask mild vs severe. Use exactly:
+"I understand you are seeking medical guidance. I couldn't quite identify your specific symptom from your message. Could you please tell me which part of your body is affected or describe what you are feeling in more detail so I can guide you to the right department?"
 
 Return ONLY JSON:
 {"extracted_symptom":"string","severity":"mild|severe|ambiguous","sentiment":"worried|uncomfortable|distressed|concerned","target_department":"...","empathetic_response":"string"}
@@ -594,8 +700,7 @@ Return ONLY JSON:
     latestMessage: string,
     conversationMessages: ChatMessage[]
   ): Promise<TriageResult> => {
-    const childContext = historyHasChildContext(conversationMessages);
-    const deterministic = runThreeGateTriage(latestMessage, conversationMessages, childContext);
+    const deterministic = runClinicalTriage(latestMessage, conversationMessages);
 
     const apiKey = process.env.OPENAI_API_KEY;
     const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
@@ -606,10 +711,10 @@ Return ONLY JSON:
       .join("\n");
 
     const userPrompt = `
-Full conversation:
+Full conversation (required for mild/severe follow-ups):
 ${historyText}
 
-LATEST user message (primary routing input):
+LATEST user message:
 ${latestMessage}
 
 Normalized latest:
@@ -657,6 +762,7 @@ ${normalizeMessage(latestMessage)}
 
       const llmResult: TriageResult = {
         gate: deterministic.gate,
+        clarification_kind: deterministic.clarification_kind,
         extracted_symptom:
           typeof parsed.extracted_symptom === "string" && parsed.extracted_symptom.trim()
             ? parsed.extracted_symptom
@@ -674,20 +780,31 @@ ${normalizeMessage(latestMessage)}
       };
 
       const latestNorm = normalizeMessage(latestMessage);
-      const gateAHit = runGateA(latestNorm);
-      if (gateAHit && llmResult.target_department === "General Physician") {
-        return gateAHit;
-      }
-      if (gateAHit && llmResult.target_department !== gateAHit.target_department) {
-        return gateAHit;
+      const gateAHit = matchesGateA(latestNorm);
+      if (gateAHit) return gateAHit;
+
+      const detGateB = runGateB(latestNorm, conversationMessages);
+      if (detGateB) {
+        if (detGateB.clarification_kind === "severity") return detGateB;
+        if (isSeverityOnlyTurn(latestNorm)) return detGateB;
+        if (detGateB.target_department !== "CLARIFICATION_REQUIRED") return detGateB;
       }
 
-      const gateBHit = runGateB(latestNorm, priorUserText(conversationMessages), childContext);
-      if (gateBHit?.target_department === "CLARIFICATION_REQUIRED" && dept === "General Physician") {
-        return gateBHit;
+      if (deterministic.clarification_kind === "unknown_symptom") {
+        return { ...deterministic, empathetic_response: UNKNOWN_SYMPTOM_RESPONSE };
       }
-      if (detectGateBSymptom(latestNorm) && dept === "General Physician" && !hasMild(latestNorm)) {
-        return deterministic;
+
+      if (resolveGateBContext(latestNorm, conversationMessages) && !hasMild(latestNorm) && !hasSevere(latestNorm)) {
+        const ctx = resolveGateBContext(latestNorm, conversationMessages)!;
+        return {
+          gate: "B",
+          clarification_kind: "severity",
+          extracted_symptom: ctx.label,
+          severity: "ambiguous",
+          sentiment: deterministic.sentiment,
+          target_department: "CLARIFICATION_REQUIRED",
+          empathetic_response: buildSeverityClarification(deterministic.sentiment, ctx.label),
+        };
       }
 
       return llmResult;
@@ -697,7 +814,7 @@ ${normalizeMessage(latestMessage)}
   };
 
   // ===========================================================================
-  // Academic node-nlp (grading artifact — not used for active routing)
+  // Academic node-nlp (grading artifact)
   // ===========================================================================
   const initializeAcademicNlpManager = async (): Promise<NlpManager> => {
     const manager = new NlpManager({ languages: ["en"], forceNER: true, autoSave: false });
@@ -739,10 +856,11 @@ ${normalizeMessage(latestMessage)}
 
     manager.addDocument("en", "My knee hurts and it is swollen after a fall.", "triage.orthopedics");
     manager.addDocument("en", "I think I fractured my wrist playing sports.", "triage.orthopedics");
+    manager.addDocument("en", "I have joint pain that is getting worse.", "triage.orthopedics");
     manager.addAnswer("en", "triage.orthopedics", nlpAnswer("triage.orthopedics"));
 
+    manager.addDocument("en", "I have a severe headache that is getting worse.", "triage.neurology");
     manager.addDocument("en", "My hands are tingling and I feel weakness on one side.", "triage.neurology");
-    manager.addDocument("en", "I felt faint and nearly collapsed this morning.", "triage.neurology");
     manager.addAnswer("en", "triage.neurology", nlpAnswer("triage.neurology"));
 
     manager.addDocument("en", "I have kidney pain on my left side.", "triage.urology");
@@ -752,7 +870,6 @@ ${normalizeMessage(latestMessage)}
     manager.addDocument("en", "My ear hurts and my hearing feels muffled.", "triage.ent");
     manager.addDocument("en", "my ear hurts", "triage.ent");
     manager.addDocument("en", "I have nose pain and sinus pressure.", "triage.ent");
-    manager.addDocument("en", "I have a sore throat and difficulty swallowing.", "triage.ent");
     manager.addAnswer("en", "triage.ent", nlpAnswer("triage.ent"));
 
     manager.addDocument("en", "I have a persistent cough and shortness of breath at night.", "triage.pulmonology");
@@ -764,7 +881,7 @@ ${normalizeMessage(latestMessage)}
     manager.addAnswer("en", "triage.pediatrics", nlpAnswer("triage.pediatrics"));
 
     manager.addDocument("en", "I have a low-grade fever and body aches since yesterday.", "triage.general_physician");
-    manager.addDocument("en", "I need help understanding my symptoms and what to do next.", "triage.general_physician");
+    manager.addDocument("en", "I have muscle pain in my shoulders.", "triage.general_physician");
     manager.addAnswer("en", "triage.general_physician", nlpAnswer("triage.general_physician"));
 
     manager.addAnswer("en", "None", nlpAnswer("None"));
@@ -802,6 +919,7 @@ ${normalizeMessage(latestMessage)}
       routedDepartment,
       sentiment: triage.sentiment,
       gate: triage.gate,
+      clarification_kind: triage.clarification_kind ?? null,
       classification: {
         extracted_symptom: triage.extracted_symptom,
         severity: triage.severity,
@@ -815,7 +933,7 @@ ${normalizeMessage(latestMessage)}
         ...basePayload,
         intent: "triage.clarification",
         score: 1,
-        source: "3-gate-triage",
+        source: "split-gate-triage",
       });
     }
 
@@ -823,7 +941,7 @@ ${normalizeMessage(latestMessage)}
       ...basePayload,
       intent: `triage.${routedDepartment.toLowerCase().replace(/\s+/g, "_")}`,
       score: 1,
-      source: "3-gate-triage",
+      source: "split-gate-triage",
     });
   } catch (error) {
     return NextResponse.json(
