@@ -27,6 +27,7 @@ export async function POST(req: Request) {
 
   type GateBCategory =
     | "musculoskeletal"
+    | "cramps"
     | "stomach"
     | "vomiting"
     | "respiratory"
@@ -98,7 +99,13 @@ export async function POST(req: Request) {
     blury: "blurry",
     muslce: "muscle",
     muslces: "muscles",
+    crampe: "cramp",
   };
+
+  const PHRASE_TYPO_REPLACEMENTS: Array<[RegExp, string]> = [
+    [/cant\s+se\s+far/gi, "can't see far"],
+    [/cant\s+see\s+far/gi, "can't see far"],
+  ];
 
   const FILLER_PATTERN = /\b(issues?|problems?|trouble|concerns?)\b/gi;
   const MILD_WORDS = ["mild", "mil", "mld", "normal", "light", "slight", "manageable", "low-grade"];
@@ -192,6 +199,9 @@ export async function POST(req: Request) {
 
   const normalizeMessage = (text: string): string => {
     let out = normalizeTypos(text.trim());
+    for (const [pattern, replacement] of PHRASE_TYPO_REPLACEMENTS) {
+      out = out.replace(pattern, replacement);
+    }
     out = out.replace(FILLER_PATTERN, "pain");
     if (/\bstomach\b/.test(out) && !/\b(pain|ache|burn|acid|discomfort)\b/.test(out)) {
       out = out.replace(/\bstomach\b/, "stomach pain");
@@ -234,12 +244,24 @@ export async function POST(req: Request) {
     return `I understand you're feeling ${feeling} about your ${symptomLabel}. Based on your symptoms, I recommend consulting a specialist in ${department} immediately.`;
   };
 
+  const isDurationTimelineTurn = (text: string): boolean => {
+    const t = normalizeMessage(text.trim());
+    if (!t) return false;
+    const words = t.split(/\s+/).filter(Boolean);
+    if (words.length > 4) return false;
+    if (/\b\d+\s*days?\b/.test(t)) return true;
+    if (/\b\d+\s*weeks?\b/.test(t)) return true;
+    if (containsAny(t, ["week", "weeks", "month", "months", "chronic"])) return true;
+    if (words.length <= 3 && /\bdays?\b/.test(t)) return true;
+    return false;
+  };
+
   const isSeverityOnlyTurn = (latest: string): boolean => {
     const t = normalizeMessage(latest.trim());
     if (!t) return false;
     const words = t.split(/\s+/).filter(Boolean);
     if (words.length > 4) return false;
-    return hasMild(t) || hasSevere(t);
+    return hasMild(t) || hasSevere(t) || isDurationTimelineTurn(latest);
   };
 
   const isUnknownGenericInput = (latest: string): boolean => {
@@ -271,6 +293,10 @@ export async function POST(req: Request) {
         "throat",
         "sinus",
         "cold",
+        "cramp",
+        "cramps",
+        "see far",
+        "near objects",
       ])) {
         return true;
       }
@@ -370,6 +396,30 @@ export async function POST(req: Request) {
     };
   };
 
+  const matchesVisionRangeIssue = (t: string): boolean =>
+    containsAny(t, [
+      "can't see far",
+      "cant see far",
+      "see far objects",
+      "see far object",
+      "far objects",
+      "blurry far",
+      "blur far",
+      "near objects",
+      "near object",
+      "can't see near",
+      "cant see near",
+      "distance vision",
+      "far away",
+      "far clearly",
+      "objects clearly",
+    ]) ||
+    (containsAny(t, ["see", "seeing", "vision"]) && containsAny(t, ["far", "distance"])) ||
+    (containsAny(t, ["blurry", "blur", "blurred"]) && containsAny(t, ["far", "near"]));
+
+  const buildCrampsClarification = (sentiment: SentimentLabel, symptomLabel: string): string =>
+    `I understand you're feeling ${sentiment === "distressed" ? "distressed" : sentiment === "worried" ? "worried" : sentiment === "uncomfortable" ? "uncomfortable" : "concerned"} about your ${symptomLabel}. I see you're experiencing ${symptomLabel}. Is the pain mild or severe, and how long have you had this (for example, 2 days or 1 week)?`;
+
   // ===========================================================================
   // GATE A — Strict specialist bypass (latest turn only)
   // ===========================================================================
@@ -397,6 +447,7 @@ export async function POST(req: Request) {
     }
 
     if (
+      matchesVisionRangeIssue(t) ||
       containsAny(t, [
         "eye",
         "eyes",
@@ -409,13 +460,16 @@ export async function POST(req: Request) {
       ])
     ) {
       const sentiment = detectSentiment(t, hasSevere(t));
+      const visionLabel = matchesVisionRangeIssue(t)
+        ? "distance or near vision difficulty"
+        : "eye/vision symptoms";
       return {
         gate: "A",
-        extracted_symptom: "eye/vision symptoms",
+        extracted_symptom: visionLabel,
         severity: "severe",
         sentiment,
         target_department: "Ophthalmology",
-        empathetic_response: buildRoutedResponse(sentiment, "eye/vision symptoms", "Ophthalmology"),
+        empathetic_response: buildRoutedResponse(sentiment, visionLabel, "Ophthalmology"),
       };
     }
 
@@ -528,6 +582,19 @@ export async function POST(req: Request) {
     const t = normalizeMessage(text);
     if (!t) return null;
 
+    if (containsAny(t, ["cramp", "cramps", "cramping"])) {
+      if (containsAny(t, ["leg", "legs"])) {
+        return { category: "cramps", label: "leg cramps" };
+      }
+      if (containsAny(t, ["muscle", "muscles"])) {
+        return { category: "cramps", label: "muscle cramps" };
+      }
+      if (containsAny(t, ["arm", "hand", "foot", "feet", "back", "neck"])) {
+        return { category: "cramps", label: "muscle cramps" };
+      }
+      return { category: "cramps", label: "cramps" };
+    }
+
     if (
       containsAny(t, [
         "back pain",
@@ -624,15 +691,75 @@ export async function POST(req: Request) {
   ): GateBContext | null => {
     const fromLatest = detectGateBSymptom(latestNormalized);
     if (fromLatest) return fromLatest;
-    if (isSeverityOnlyTurn(latestNormalized)) {
+    if (
+      isSeverityOnlyTurn(latestNormalized) ||
+      detectDurationTier(latestNormalized) !== "none"
+    ) {
       return findGateBSymptomInHistory(conversationMessages);
     }
     return null;
   };
 
+  const runCrampsMatrix = (
+    gateB: GateBContext,
+    latestNormalized: string,
+    conversationMessages: ChatMessage[],
+    sentiment: SentimentLabel
+  ): TriageResult => {
+    const contextText = getGateBContextText(latestNormalized, conversationMessages);
+    const mild = hasMild(contextText);
+    const severe = hasSevere(contextText);
+    const durationTier = detectDurationTier(contextText);
+
+    if (severe || durationTier === "chronic") {
+      return {
+        gate: "B-chronic",
+        extracted_symptom: gateB.label,
+        severity: "severe",
+        sentiment,
+        target_department: "Orthopedics",
+        empathetic_response: buildRoutedResponse(sentiment, gateB.label, "Orthopedics"),
+      };
+    }
+
+    if (mild && (durationTier === "acute" || durationTier === "none")) {
+      return {
+        gate: "B",
+        extracted_symptom: gateB.label,
+        severity: "mild",
+        sentiment,
+        target_department: "General Physician",
+        empathetic_response: buildRoutedResponse(sentiment, gateB.label, "General Physician"),
+      };
+    }
+
+    if (durationTier === "acute" && !mild && !severe) {
+      return {
+        gate: "B",
+        clarification_kind: "severity",
+        extracted_symptom: gateB.label,
+        severity: "ambiguous",
+        sentiment,
+        target_department: "CLARIFICATION_REQUIRED",
+        empathetic_response: buildSeverityClarification(sentiment, gateB.label),
+      };
+    }
+
+    return {
+      gate: "B",
+      clarification_kind: "severity",
+      extracted_symptom: gateB.label,
+      severity: "ambiguous",
+      sentiment,
+      target_department: "CLARIFICATION_REQUIRED",
+      empathetic_response: buildCrampsClarification(sentiment, gateB.label),
+    };
+  };
+
   const severeDeptForGateB = (category: GateBCategory): TargetDepartment => {
     switch (category) {
       case "musculoskeletal":
+      case "cramps":
         return "Orthopedics";
       case "stomach":
       case "vomiting":
@@ -666,6 +793,10 @@ export async function POST(req: Request) {
         target_department: "General Physician",
         empathetic_response: buildRoutedResponse(sentiment, gateB.label, "General Physician"),
       };
+    }
+
+    if (gateB.category === "cramps") {
+      return runCrampsMatrix(gateB, latestNormalized, conversationMessages, sentiment);
     }
 
     // Chronic escalation: >5 days / weeks / months — skip mild/severe question
@@ -786,7 +917,9 @@ COMMON COLD (instant, no questions):
 
 GATE A — STRICT SPECIALIST BYPASS (latest message only; NEVER ask mild/severe; NEVER General Physician):
 - Heart/chest/palpitations -> Cardiology
-- Eyes/vision/blurry -> Ophthalmology
+- Eyes/vision/blurry AND vision-range issues -> Ophthalmology instantly:
+  * "can't see far", "cant se far" (typos), "see far objects", "blurry far", "near objects"
+  * e.g. "Can't see far objects clearly" -> Ophthalmology (no questions)
 - Fracture/dislocation/joint pain/joints pain ONLY -> Orthopedics (NOT back pain, leg pain, or muscle pain)
 - Skin/rash/allergies/pimples/itching -> Dermatology
 - Burning urine/kidney pain/bladder issues -> Urology
@@ -794,8 +927,11 @@ GATE A — STRICT SPECIALIST BYPASS (latest message only; NEVER ask mild/severe;
 - ENT instant bypass: nose/noze, ear/ear pain/earache, throat/sore throat, sinus -> ENT (turn 1, no severity question)
 
 GATE B — INTERACTIVE (ask mild vs severe when ambiguous):
+CRAMPS MATRIX (cramps, muscle cramps, leg cramps):
+  - Duration <=4 days AND mild -> General Physician | Duration >=5 days OR severe -> Orthopedics
+  - Ambiguous (e.g. "cramps in legs" only) -> ask mild/severe AND how long; then apply matrix
 Musculoskeletal aches ONLY: back pain, leg pain, hand pain, arm, shoulder, neck, muscle, muscles, body ache
-  - Mild (or mil/mld) -> General Physician | Severe (or svr/sevr) -> Orthopedics
+  - Mild (or mil/mld) -> General Physician | Severe (or svr/sevr/sevear) -> Orthopedics
 Stomach pain, acidity, nausea, vomiting -> Gastroenterology (severe) or General Physician (mild)
 Respiratory: breathing, cough, congestion -> Pulmonology (severe) or General Physician (mild)
 Headache, migraine -> Neurology (severe) or General Physician (mild)
@@ -908,9 +1044,34 @@ ${normalizeMessage(latestMessage)}
       const gateAHit = matchesGateA(latestNorm);
       if (gateAHit) return gateAHit;
 
+      if (matchesVisionRangeIssue(latestNorm)) {
+        const sentiment = detectSentiment(latestNorm, false);
+        return {
+          gate: "A",
+          extracted_symptom: "distance or near vision difficulty",
+          severity: "severe",
+          sentiment,
+          target_department: "Ophthalmology",
+          empathetic_response: buildRoutedResponse(
+            sentiment,
+            "distance or near vision difficulty",
+            "Ophthalmology"
+          ),
+        };
+      }
+
       const detGateB = runGateB(latestNorm, conversationMessages);
       if (detGateB) {
         if (detGateB.gate === "B-chronic") return detGateB;
+        const crampsCtx = resolveGateBContext(latestNorm, conversationMessages);
+        if (crampsCtx?.category === "cramps") {
+          return runCrampsMatrix(
+            crampsCtx,
+            latestNorm,
+            conversationMessages,
+            detGateB.sentiment
+          );
+        }
         if (detGateB.clarification_kind === "severity") return detGateB;
         if (isSeverityOnlyTurn(latestNorm)) return detGateB;
         if (detGateB.target_department !== "CLARIFICATION_REQUIRED") return detGateB;
@@ -974,6 +1135,7 @@ ${normalizeMessage(latestMessage)}
 
     manager.addDocument("en", "I have eye pain and sensitivity to light since this morning.", "triage.ophthalmology");
     manager.addDocument("en", "My vision is blurry and I have trouble focusing on text.", "triage.ophthalmology");
+    manager.addDocument("en", "I can't see far objects clearly.", "triage.ophthalmology");
     manager.addAnswer("en", "triage.ophthalmology", nlpAnswer("triage.ophthalmology"));
 
     manager.addDocument("en", "I have an itchy rash that has spread over my arms.", "triage.dermatology");
@@ -1008,6 +1170,7 @@ ${normalizeMessage(latestMessage)}
 
     manager.addDocument("en", "I have a low-grade fever and body aches since yesterday.", "triage.general_physician");
     manager.addDocument("en", "I have muscle pain in my shoulders.", "triage.general_physician");
+    manager.addDocument("en", "I am having cramps in my legs.", "triage.orthopedics");
     manager.addDocument("en", "I think I have a common cold.", "triage.general_physician");
     manager.addDocument("en", "I have a cold and runny nose.", "triage.general_physician");
     manager.addAnswer("en", "triage.general_physician", nlpAnswer("triage.general_physician"));
